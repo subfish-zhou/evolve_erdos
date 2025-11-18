@@ -8,6 +8,7 @@ from core.interfaces import (
     PromptDesignerInterface, CodeGeneratorInterface, EvaluatorAgentInterface,
     DatabaseAgentInterface, SelectionControllerInterface
 )
+from core.fitness import selection_sort_key, ensure_program_fitness
 from config import settings
 
 from prompt_designer.agent import PromptDesignerAgent
@@ -30,7 +31,7 @@ class TaskManagerAgent(TaskManagerInterface):
         self.database: DatabaseAgentInterface = InMemoryDatabaseAgent()
         logger.info(f"Using {settings.DATABASE_TYPE} database (InMemoryDatabaseAgent).")
             
-        self.selection_controller: SelectionControllerInterface = SelectionControllerAgent()
+        self.selection_controller: SelectionControllerInterface = SelectionControllerAgent(task_definition=self.task_definition)
 
         self.population_size = settings.POPULATION_SIZE
         self.num_generations = settings.GENERATIONS
@@ -59,7 +60,9 @@ class TaskManagerAgent(TaskManagerInterface):
                 id=program_id,
                 code=generated_code,
                 generation=0,
-                status="unevaluated"
+                status="unevaluated",
+                task_id=self.task_definition.id,
+                prompt_id=getattr(self.prompt_designer, "last_prompt_metadata", {}).get("template_id") if hasattr(self.prompt_designer, "last_prompt_metadata") else None,
             )
             initial_population.append(program)
             await self.database.save_program(program)
@@ -73,12 +76,12 @@ class TaskManagerAgent(TaskManagerInterface):
     async def evaluate_population(self, population: List[Program]) -> List[Program]:
         logger.info(f"Evaluating population of {len(population)} programs.")
         evaluated_programs = []
-        evaluation_tasks = [self.evaluator.evaluate_program(prog, self.task_definition) for prog in population if prog.status != "evaluated"]
+        programs_to_evaluate = [prog for prog in population if prog.status != "evaluated"]
+        evaluation_tasks = [self.evaluator.evaluate_program(prog, self.task_definition) for prog in programs_to_evaluate]
         
         results = await asyncio.gather(*evaluation_tasks, return_exceptions=True)
         
-        for i, result in enumerate(results):
-            original_program = population[i]
+        for original_program, result in zip(programs_to_evaluate, results):
             if isinstance(result, Exception):
                 logger.error(f"Error evaluating program {original_program.id}: {result}", exc_info=result)
                 original_program.status = "failed_evaluation"
@@ -86,7 +89,11 @@ class TaskManagerAgent(TaskManagerInterface):
                 evaluated_programs.append(original_program)
             else:
                 evaluated_programs.append(result)
+            evaluated_programs[-1].task_id = self.task_definition.id
             await self.database.save_program(evaluated_programs[-1])
+
+        # Preserve already evaluated programs
+        evaluated_programs.extend([prog for prog in population if prog.status == "evaluated"])
             
         logger.info(f"Finished evaluating population. {len(evaluated_programs)} programs processed.")
         return evaluated_programs
@@ -141,19 +148,29 @@ class TaskManagerAgent(TaskManagerInterface):
             # Log best program in this generation
             best_program_this_gen = sorted(
                 current_population,
-                key=lambda p: (p.fitness_scores.get("correctness", -1), -p.fitness_scores.get("runtime_ms", float('inf'))),
+                key=lambda p: selection_sort_key(p, self.task_definition),
                 reverse=True
             )
             if best_program_this_gen:
-                logger.info(f"Generation {gen}: Best program: ID={best_program_this_gen[0].id}, Fitness={best_program_this_gen[0].fitness_scores}")
+                best_program = best_program_this_gen[0]
+                ensure_program_fitness(best_program, self.task_definition)
+                logger.info(
+                    f"Generation {gen}: Best program: ID={best_program.id}, "
+                    f"Fitness={best_program.fitness:.4f}, Metrics={best_program.metrics or best_program.fitness_scores}"
+                )
             else:
                 logger.warning(f"Generation {gen}: No programs in current population after survival selection.")
                 break
 
         logger.info("Evolutionary cycle completed.")
-        final_best = await self.database.get_best_programs(task_id=self.task_definition.id, limit=1, objective="correctness")
+        final_best = await self.database.get_best_programs(task_id=self.task_definition.id, limit=1)
         if final_best:
-            logger.info(f"Overall Best Program: {final_best[0].id}, Code:\n{final_best[0].code}\nFitness: {final_best[0].fitness_scores}")
+            best_program = final_best[0]
+            ensure_program_fitness(best_program, self.task_definition)
+            logger.info(
+                f"Overall Best Program: {best_program.id}, Code:\n{best_program.code}\n"
+                f"Fitness: {best_program.fitness:.4f}, Metrics: {best_program.metrics or best_program.fitness_scores}"
+            )
         else:
             logger.info("No best program found at the end of evolution.")
         return final_best
@@ -164,8 +181,10 @@ class TaskManagerAgent(TaskManagerInterface):
         prompt_type = "mutation"
         # Default to primary for bug fixes or high-fitness mutations
         chosen_model = settings.LLM_PRIMARY_MODEL 
+        parent_metrics = parent.metrics or parent.fitness_scores
+        parent_fitness = ensure_program_fitness(parent, self.task_definition)
 
-        if parent.errors and parent.fitness_scores.get("correctness", 1.0) < settings.BUG_FIX_CORRECTNESS_THRESHOLD:
+        if parent.errors and parent_metrics.get("correctness", 1.0) < settings.BUG_FIX_CORRECTNESS_THRESHOLD:
             primary_error = parent.errors[0]
             execution_details = None
             if len(parent.errors) > 1 and isinstance(parent.errors[1], str) and ("stdout" in parent.errors[1].lower() or "stderr" in parent.errors[1].lower()):
@@ -181,7 +200,7 @@ class TaskManagerAgent(TaskManagerInterface):
             # chosen_model remains LLM_PRIMARY_MODEL for bug fixing
         else:
             # Decide model for mutation based on parent fitness
-            if parent.fitness_scores.get("correctness", 0.0) >= settings.HIGH_FITNESS_THRESHOLD_FOR_PRIMARY_LLM:
+            if parent_fitness >= settings.HIGH_FITNESS_THRESHOLD_FOR_PRIMARY_LLM:
                 # chosen_model is already LLM_PRIMARY_MODEL
                 logger.info(f"Parent {parent.id} has high fitness, using primary model {chosen_model} for mutation.")
             else:
@@ -190,8 +209,8 @@ class TaskManagerAgent(TaskManagerInterface):
 
             feedback = {
                 "errors": parent.errors,
-                "correctness_score": parent.fitness_scores.get("correctness"),
-                "runtime_ms": parent.fitness_scores.get("runtime_ms")
+                "metrics": parent_metrics,
+                "scalar_fitness": parent_fitness,
             }
             feedback = {k: v for k, v in feedback.items() if v is not None}
 
@@ -228,7 +247,9 @@ class TaskManagerAgent(TaskManagerInterface):
             generation=generation_num,
             parent_id=parent.id,
             island_id=parent.island_id,  # Inherit island ID from parent
-            status="unevaluated"
+            status="unevaluated",
+            task_id=self.task_definition.id,
+            prompt_id=getattr(self.prompt_designer, "last_prompt_metadata", {}).get("template_id") if hasattr(self.prompt_designer, "last_prompt_metadata") else None,
         )
         logger.info(f"Successfully generated offspring {offspring.id} from parent {parent.id} ({prompt_type}).")
         return offspring

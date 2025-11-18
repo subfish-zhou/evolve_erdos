@@ -1,8 +1,15 @@
                         
 from typing import Optional, Dict, Any
 import logging
+import random
+import json
 
 from core.interfaces import PromptDesignerInterface, Program, TaskDefinition, BaseAgent
+from prompt_designer.prompt_templates import (
+    INITIAL_PROMPT_TEMPLATES,
+    MUTATION_PROMPT_TEMPLATES,
+    BUGFIX_PROMPT_TEMPLATES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -10,25 +17,64 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
     def __init__(self, task_definition: TaskDefinition):
         super().__init__()
         self.task_definition = task_definition
+        self.last_prompt_metadata: Dict[str, Any] = {}
         logger.info(f"PromptDesignerAgent initialized for task: {self.task_definition.id}")
+
+    def _choose_template(self, pool, prompt_type: str) -> Dict[str, Any]:
+        template = random.choice(pool)
+        self.last_prompt_metadata = {"template_id": template["id"], "prompt_type": prompt_type}
+        return template
+
+    def _metrics_guidance(self) -> str:
+        if self.task_definition.evaluation_mode != "metrics":
+            return ""
+
+        lines = [
+            "Evaluation mode: continuous multi-metric scoring.",
+            f"- The evaluator module `{self.task_definition.metrics_eval_module}` calls `evaluate_candidate(module, task_definition)` to compute metrics.",
+            "- Your program must behave like a search heuristic and emit rich telemetry (e.g., best_violation, samples_tried, success flags) so selection can reason about progress.",
+        ]
+
+        if self.task_definition.metrics_primary_key:
+            lines.append(f"- Primary optimization target: `{self.task_definition.metrics_primary_key}`.")
+        if self.task_definition.metrics_scalarization:
+            weights = ", ".join(f"{k}:{v}" for k, v in self.task_definition.metrics_scalarization.items())
+            lines.append(f"- Scalarization weights: {weights}")
+        if self.task_definition.evaluation_criteria:
+            try:
+                criteria_str = json.dumps(self.task_definition.evaluation_criteria, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                criteria_str = str(self.task_definition.evaluation_criteria)
+            lines.append(f"- Evaluation configuration:\n{criteria_str}")
+
+        return "\n".join(lines) + "\n\n"
 
     def design_initial_prompt(self) -> str:
         logger.info(f"Designing initial prompt for task: {self.task_definition.id}")
-                                                           
+        template = self._choose_template(INITIAL_PROMPT_TEMPLATES, "initial")
+        persona = template["persona"]
+        style_notes = template.get("style_notes", "")
+        metrics_section = self._metrics_guidance()
+        allowed_imports = (
+            ", ".join(self.task_definition.allowed_imports)
+            if self.task_definition.allowed_imports
+            else "Only standard-library modules are allowed unless explicitly stated otherwise"
+        )
+
         expert_knowledge_section = ""
         if self.task_definition.expert_knowledge:
             expert_knowledge_section = f"Relevant Expert Knowledge or Context:\\n{self.task_definition.expert_knowledge}\\n\\n"
 
         prompt = (
-            f"You are an expert Python programmer. Your task is to write a Python function based on the following specifications.\\n\\n"
+            f"{persona}\\n{style_notes}\\n\\n"
+            f"{metrics_section}"
             f"Task Description: {self.task_definition.description}\\n\\n"
             f"{expert_knowledge_section}"
             f"Function to Implement: `{self.task_definition.function_name_to_evolve}`\\n\\n"
             f"Input/Output Examples:\n"
-                                         
             f"{self._format_input_output_examples()}\n\n"
             f"Evaluation Criteria: {self.task_definition.evaluation_criteria}\n\n"
-            f"Allowed Standard Library Imports: {self.task_definition.allowed_imports}. Do not use any other external libraries or packages.\n\n"
+            f"Allowed Standard Library Imports: {allowed_imports}. Do not use any other external libraries or packages.\n\n"
             f"Your Response Format:\n"
             f"Please provide *only* the complete Python code for the function `{self.task_definition.function_name_to_evolve}`. "
             f"The code should be self-contained or rely only on the allowed imports. "
@@ -58,6 +104,8 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
                 examples.append(f"Input: {input_str}\nOutput: {output_str}")
         
         if not examples:
+            if self.task_definition.evaluation_mode == "metrics":
+                return "This task relies on metrics-based evaluation; provide a search heuristic that reports telemetry instead of deterministic I/O pairs."
             return "No input/output examples provided."
         
         return "\n\n".join(examples)
@@ -69,14 +117,24 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
         correctness = evaluation_feedback.get("correctness_score", None)
         runtime = evaluation_feedback.get("runtime_ms", None)
         errors = evaluation_feedback.get("errors", [])                          
-                                                                                               
         stderr = evaluation_feedback.get("stderr", None)
+        metrics = evaluation_feedback.get("metrics")
+        scalar_fitness = evaluation_feedback.get("scalar_fitness")
 
         feedback_parts = []
         if correctness is not None:
             feedback_parts.append(f"- Correctness Score: {correctness*100:.2f}%")
         if runtime is not None:
             feedback_parts.append(f"- Runtime: {runtime:.2f} ms")
+        if scalar_fitness is not None:
+            feedback_parts.append(f"- Scalar Fitness Used For Selection: {scalar_fitness:.4f}")
+        if metrics:
+            numeric_metrics = [
+                f"{k}={v:.4f}" for k, v in metrics.items()
+                if isinstance(v, (int, float))
+            ]
+            if numeric_metrics:
+                feedback_parts.append(f"- Reported Metrics: {', '.join(numeric_metrics)}")
         
         if errors:
             error_messages = "\n".join([f"  - {e}" for e in errors])
@@ -96,6 +154,10 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
     def design_mutation_prompt(self, program: Program, evaluation_feedback: Optional[Dict[str, Any]] = None) -> str:
         logger.info(f"Designing mutation prompt for program: {program.id} (Generation: {program.generation})")
         logger.debug(f"Parent program code (to be mutated):\\n{program.code}")
+        template = self._choose_template(MUTATION_PROMPT_TEMPLATES, "mutation")
+        persona = template["persona"]
+        style_notes = template.get("style_notes", "")
+        metrics_section = self._metrics_guidance()
         
         expert_knowledge_section = ""
         if self.task_definition.expert_knowledge:
@@ -120,7 +182,8 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
         )
 
         prompt = (
-            f"You are an expert Python programmer. Your task is to improve an existing Python function based on its previous performance and the overall goal.\\n\\n"
+            f"{persona}\\n{style_notes}\\n\\n"
+            f"{metrics_section}"
             f"Overall Task Description: {self.task_definition.description}\\n\\n"
             f"{expert_knowledge_section}"
             f"Function to Improve: `{self.task_definition.function_name_to_evolve}`\\n\\n"
@@ -140,6 +203,10 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
     def design_bug_fix_prompt(self, program: Program, error_message: str, execution_output: Optional[str] = None) -> str:
         logger.info(f"Designing bug-fix prompt for program: {program.id} (Generation: {program.generation})")
         logger.debug(f"Buggy program code:\\n{program.code}")
+        template = self._choose_template(BUGFIX_PROMPT_TEMPLATES, "bug_fix")
+        persona = template["persona"]
+        style_notes = template.get("style_notes", "")
+        metrics_section = self._metrics_guidance()
         
         expert_knowledge_section = ""
         if self.task_definition.expert_knowledge:
@@ -165,7 +232,8 @@ class PromptDesignerAgent(PromptDesignerInterface, BaseAgent):
         )
 
         prompt = (
-            f"You are an expert Python programmer. Your task is to fix a bug in an existing Python function.\\n\\n"
+            f"{persona}\\n{style_notes}\\n\\n"
+            f"{metrics_section}"
             f"Overall Task Description: {self.task_definition.description}\\n\\n"
             f"{expert_knowledge_section}"
             f"Function to Fix: `{self.task_definition.function_name_to_evolve}`\\n\\n"

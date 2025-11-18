@@ -14,7 +14,8 @@ function_name: "solve_shortest_paths"
 allowed_imports: ["heapq"]
 
 tests:
-  - description: "Shortest path test cases for weighted directed graphs"
+  - name: "weighted_graph_examples"
+    description: "Shortest path test cases for weighted directed graphs"
     test_cases:
       - input: [{"A": {"B": 1, "C": 4}, "B": {"C": 2, "D": 5}, "C": {"D": 1}, "D": {}}, "A"]
         output: {"A": 0, "B": 1, "C": 3, "D": 4}
@@ -23,16 +24,16 @@ tests:
         output: {"A": 0, "B": 1, "C": 6, "D": 7}
 
       - input: [{"A": {"B": 1}, "B": {}, "C": {"D": 1}, "D": {}}, "A"]
-        output: {"A": 0, "B": 1, "C": float('inf'), "D": float('inf')}
+        output: {"A": 0, "B": 1, "C": .inf, "D": .inf}
 
       - input: [{"A": {}, "B": {"C": 1}}, "A"]
-        output: {"A": 0, "B": float('inf'), "C": float('inf')}
+        output: {"A": 0, "B": .inf, "C": .inf}
 
       - input: [{}, "A"]
         output: {"A": 0}
 
       - input: [{"X": {"Y": 1}}, "Z"]
-        output: {"Z": 0, "X": float('inf'), "Y": float('inf')}
+        output: {"Z": 0, "X": .inf, "Y": .inf}
 
       - input: [
           {
@@ -62,7 +63,8 @@ tests:
         ]
         output: {"A": 0, "B": 1, "C": 10, "D": 3, "E": 6, "F": 11, "G": 6, "H": 13, "I": 8}
 
-  - description: "Validation function examples"
+  - name: "validation_sanity"
+    description: "Validation function examples"
     test_cases:
       - input: [{"A": {"B": 1}, "B": {"C": 2}}, "A"]
         validation_func: |

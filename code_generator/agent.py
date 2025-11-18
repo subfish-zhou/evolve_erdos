@@ -17,10 +17,34 @@ from core.interfaces import CodeGeneratorInterface
 
 logger = logging.getLogger(__name__)
 
+# 条件导入 Azure OpenAI 客户端
+try:
+    from azure_api import get_azure_client, AzureOpenAIClient
+    from openai import BadRequestError as OpenAIBadRequestError
+    AZURE_AVAILABLE = True
+except ImportError:
+    AZURE_AVAILABLE = False
+    OpenAIBadRequestError = None
+    logger.warning("Azure OpenAI module not available. Install required dependencies to use Azure OpenAI.")
+
 class CodeGeneratorAgent(CodeGeneratorInterface):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.model_name = settings.LITELLM_DEFAULT_MODEL
+        
+        # 检查是否使用 Azure OpenAI
+        self.use_azure = getattr(settings, 'USE_AZURE_OPENAI', False) and AZURE_AVAILABLE
+        
+        if self.use_azure:
+            # 使用 Azure OpenAI
+            self.azure_client = get_azure_client()
+            self.model_name = getattr(settings, 'AZURE_DEPLOYMENT_NAME', 'gpt-5-mini')
+            logger.info(f"CodeGeneratorAgent initialized with Azure OpenAI, deployment: {self.model_name}")
+        else:
+            # 使用 LiteLLM
+            self.model_name = settings.LITELLM_DEFAULT_MODEL
+            self.azure_client = None
+            logger.info(f"CodeGeneratorAgent initialized with LiteLLM, model: {self.model_name}")
+        
         self.generation_config = {
             "temperature": settings.LITELLM_TEMPERATURE,
             "top_p": settings.LITELLM_TOP_P,
@@ -30,7 +54,6 @@ class CodeGeneratorAgent(CodeGeneratorInterface):
         self.litellm_extra_params = {
             "base_url": settings.LITELLM_DEFAULT_BASE_URL,
         }
-        logger.info(f"CodeGeneratorAgent initialized with model: {self.model_name}")
 
     async def generate_code(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = None, output_format: str = "code", litellm_extra_params: Optional[Dict[str, Any]] = None) -> str:
         effective_model_name = model_name if model_name else self.model_name
@@ -86,21 +109,83 @@ Make sure your diff can be applied correctly!
         retries = settings.API_MAX_RETRIES
         delay = settings.API_RETRY_DELAY_SECONDS
         
+        # 确定使用 Azure OpenAI 还是 LiteLLM
+        # 如果启用了 Azure OpenAI，优先使用 Azure OpenAI（无论模型名称是什么）
+        # 只有在 Azure OpenAI 未启用时，才使用 LiteLLM
+        # 注意：使用 Azure OpenAI 时，模型名称参数会被忽略，使用配置的部署名称
+        use_azure_for_this_call = self.use_azure
+        
+        if use_azure_for_this_call and model_name and model_name != self.model_name:
+            logger.info(f"Azure OpenAI is enabled. Model name '{model_name}' will be ignored, using Azure deployment '{self.model_name}' instead.")
+        
         for attempt in range(retries):
             try:
-                logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {effective_model_name}.")
-                response = await acompletion(
-                    model=effective_model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    **(current_generation_config or {}),
-                    **(litellm_extra_params or {})
-                )
+                logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {effective_model_name} (Azure: {use_azure_for_this_call}).")
                 
-                if not response.choices:
-                    logger.warning("LLM API returned no choices.")
-                    return ""
+                if use_azure_for_this_call and self.azure_client:
+                    # 使用 Azure OpenAI
+                    try:
+                        messages = [{"role": "user", "content": prompt}]
+                        
+                        # GPT-5 不支持自定义 temperature，只支持默认值 1
+                        # 如果部署名称是 gpt-5，则不传递 temperature 参数
+                        azure_params = {
+                            "messages": messages,
+                            "max_completion_tokens": current_generation_config.get("max_tokens"),
+                        }
+                        
+                        # 只有当部署不是 gpt-5 时才传递 temperature 和 top_p
+                        deployment_name = getattr(settings, 'AZURE_DEPLOYMENT_NAME', 'gpt-5-mini')
+                        if deployment_name.strip().lower() != "gpt-5":
+                            if current_generation_config.get("temperature") is not None:
+                                azure_params["temperature"] = current_generation_config.get("temperature")
+                            if current_generation_config.get("top_p") is not None:
+                                azure_params["top_p"] = current_generation_config.get("top_p")
+                        
+                        response = await self.azure_client.chat_completion(**azure_params)
+                        
+                        if not response.choices:
+                            logger.warning("Azure OpenAI API returned no choices.")
+                            return ""
+                        
+                        generated_text = response.choices[0].message.content
+                    except Exception as azure_error:
+                        # 将 Azure OpenAI 异常转换为 BadRequestError 以便统一处理
+                        logger.warning(f"Azure OpenAI error: {type(azure_error).__name__} - {azure_error}")
+                        # 如果是 openai 的 BadRequestError，转换为 litellm 的 BadRequestError
+                        if OpenAIBadRequestError and isinstance(azure_error, OpenAIBadRequestError):
+                            error_msg = str(azure_error)
+                            raise BadRequestError(
+                                message=error_msg,
+                                llm_provider="azure_openai",
+                                model=effective_model_name
+                            ) from azure_error
+                        # 如果是 litellm 的 BadRequestError，直接抛出
+                        elif isinstance(azure_error, BadRequestError):
+                            raise
+                        # 其他异常也转换为 BadRequestError
+                        else:
+                            error_msg = str(azure_error)
+                            raise BadRequestError(
+                                message=error_msg,
+                                llm_provider="azure_openai",
+                                model=effective_model_name
+                            ) from azure_error
+                else:
+                    # 使用 LiteLLM
+                    response = await acompletion(
+                        model=effective_model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        **(current_generation_config or {}),
+                        **(litellm_extra_params or {})
+                    )
+                    
+                    if not response.choices:
+                        logger.warning("LLM API returned no choices.")
+                        return ""
 
-                generated_text = response.choices[0].message.content
+                    generated_text = response.choices[0].message.content
+                
                 logger.debug(f"Raw response from LLM API:\n--RESPONSE START--\n{generated_text}\n--RESPONSE END--")
                 
                 if output_format == "code":

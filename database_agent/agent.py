@@ -10,6 +10,7 @@ from core.interfaces import (
     Program,
     BaseAgent,
 )
+from core.fitness import ensure_program_fitness, selection_sort_key
 from config import settings # Added to access DATABASE_PATH
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class InMemoryDatabaseAgent(DatabaseAgentInterface, BaseAgent):
         # For simplicity at startup, keeping it sync.
         if os.path.exists(self._db_file_path):
             try:
-                with open(self._db_file_path, 'r') as f:
+                with open(self._db_file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for prog_id, prog_data in data.items():
                         # Re-hydrate Program objects
@@ -51,7 +52,7 @@ class InMemoryDatabaseAgent(DatabaseAgentInterface, BaseAgent):
             try:
                 # Serialize Program objects to dictionaries
                 data_to_save = {prog_id: prog.__dict__ for prog_id, prog in self._programs.items()}
-                with open(self._db_file_path, 'w') as f:
+                with open(self._db_file_path, 'w', encoding='utf-8') as f:
                     json.dump(data_to_save, f, indent=4)
                 logger.debug(f"Successfully saved {len(self._programs)} programs to {self._db_file_path}")
             except Exception as e:
@@ -87,23 +88,35 @@ class InMemoryDatabaseAgent(DatabaseAgentInterface, BaseAgent):
         objective: Literal["correctness", "runtime_ms"] = "correctness",
         sort_order: Literal["asc", "desc"] = "desc",
     ) -> List[Program]:
-        logger.info(f"Retrieving best programs (task: {task_id}). Limit: {limit}, Objective: {objective}, Order: {sort_order}")
+        logger.info(f"Retrieving best programs (task: {task_id}). Limit: {limit}")
         if not self._programs:
             logger.info("No programs in database to retrieve 'best' from.")
             return []
 
-        all_progs = list(self._programs.values())
+        all_progs = [
+            p for p in self._programs.values()
+            if task_id is None or getattr(p, "task_id", None) == task_id
+        ]
+        if not all_progs:
+            return []
 
+        reverse = sort_order == "desc"
         if objective == "correctness":
-            sorted_programs = sorted(all_progs, key=lambda p: p.fitness_scores.get("correctness", 0.0), reverse=(sort_order == "desc"))
+            sorted_programs = sorted(
+                all_progs,
+                key=lambda p: p.fitness_scores.get("correctness", 0.0),
+                reverse=reverse,
+            )
         elif objective == "runtime_ms":
-            # For runtime_ms: sort_order='asc' (best) means reverse=False (lowest first)
-            # sort_order='desc' (worst) means reverse=True (highest first)
-            sorted_programs = sorted(all_progs, key=lambda p: p.fitness_scores.get("runtime_ms", float('inf')), reverse=(sort_order == "desc"))
+            sorted_programs = sorted(
+                all_progs,
+                key=lambda p: p.fitness_scores.get("runtime_ms", float('inf')),
+                reverse=reverse,
+            )
         else:
-            logger.warning(f"Unknown objective: {objective}. Defaulting to no specific sort order beyond Program ID.")
-            return sorted(all_progs, key=lambda p: p.id)[:limit]
-
+            for prog in all_progs:
+                ensure_program_fitness(prog, None)
+            sorted_programs = sorted(all_progs, key=lambda p: selection_sort_key(p, None), reverse=True)
         logger.debug(f"Sorted {len(sorted_programs)} programs. Top 3 (if available): {[p.id for p in sorted_programs[:3]]}")
         return sorted_programs[:limit]
 

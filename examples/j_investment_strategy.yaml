@@ -1,0 +1,117 @@
+task_id: "j_investment_strategy"
+task_description: |
+  Goal: Evolve an investment strategy function that, given historical candlestick
+  (K-line) data, predicts the next 100 closing prices. The evaluation metric is
+  the sum of rolling multi-step mean squared errors (MSE) on a held-out test set;
+  smaller total error is better.
+
+  Data file:
+    - File name: "j_raw_data_2022-01-01_2025-08-29.csv"
+    - Example CSV header:
+        ,open,high,low,close,volume
+        2022-01-04 09:15:00,2946.828,3034.365,2946.828,2996.876,10845.0
+        2022-01-04 09:30:00,2998.284,3008.442,2971.597,2985.685,2720.0
+        2022-01-04 09:45:00,2985.685,2992.188,2971.649,2982.149,1375.0
+
+      The first column is the time index (parseable as datetime). The remaining
+      columns are open, high, low, close, and volume. For evaluation, we use the
+      close column as the target series; other columns may be used as features.
+
+  Function to be evolved (Python signature):
+
+      def predict_next_100(history_closes):
+          """
+          Parameters
+          ----------
+          history_closes: list[float]
+              All historical closing prices up to the current time, in ascending
+              time order.
+
+          Returns
+          -------
+          list[float]
+              A list of length 100, representing predictions for the next 100
+              time steps of closing prices.
+          """
+
+  Evaluation / test logic (implemented in a separate Python module; this block
+  is a textual specification):
+
+  1. Load the full time series from the CSV and extract the closing price
+     sequence close[0..N-1].
+  2. Split into train and test using an 0.8 / 0.2 ratio in time order:
+       - train = close[0 : floor(0.8 * N)]
+       - test  = close[floor(0.8 * N) : ]
+  3. On the test set, perform rolling multi-step prediction with a window size
+     of 100:
+       - Initialize:
+           history = train
+           pos = 0        # position in the test sequence
+           total_mse = 0.0
+       - Loop until pos reaches the end of the test sequence:
+           a) Call the evolved function:
+                  preds = predict_next_100(history)
+              preds must be a list of 100 real numbers.
+           b) Take the ground-truth window:
+                  true_window = test[pos : pos + 100]
+              If fewer than 100 points remain, let L = len(true_window) < 100,
+              and compare preds[:L] to true_window.
+           c) Compute the mean squared error on this window:
+                  mse = mean( (preds[i] - true_window[i])**2 for i in range(L) )
+              Add mse to total_mse.
+           d) Append the true_window (not predictions) to history for the next
+              step:
+                  history = history + true_window
+                  pos += 100
+  4. The evaluation metric for the whole test set is total_mse:
+       - Smaller total_mse is better.
+       - In OpenAlpha_Evolve, we can define fitness = -total_mse so that higher
+         fitness is better.
+
+  Constraints and notes:
+    - The function may internally use any time-series method (moving averages,
+      ARIMA, ML models, feature engineering, etc.), but must respect the interface:
+      input is a list of historical closes, output is a list of 100 predictions.
+    - The function must not directly look ahead into future test data (e.g., by
+      reading the test segment from disk and returning it as predictions).
+      The evaluation logic will independently load the CSV and call the
+      candidate function.
+    - You may use numpy / pandas for numerical and data-processing operations.
+
+function_name: "predict_next_100"
+
+allowed_imports:
+  - "math"
+  - "statistics"
+  - "random"
+  - "numpy"
+  - "pandas"
+
+# These fields assume you have added a "metrics" evaluation mode to OpenAlpha_Evolve
+# as previously discussed. If not, you can comment them out and rely only on tests.
+evaluation_mode: "metrics"
+metrics_eval_module: "examples.j_investment_eval"   # You will implement this module
+metrics_primary_key: "neg_total_mse"
+metrics_scalarization:
+  neg_total_mse: 1.0
+
+# Tests only perform basic shape checks: the function should run and return
+# 100 real numbers. The real continuous MSE metric is implemented in
+# metrics_eval_module.
+tests:
+  - description: "Sanity checks for predict_next_100 output shape"
+    name: "basic_shape_checks"
+    test_cases:
+      - input:
+          - [100.0, 101.0, 102.5, 103.2, 104.1, 105.0, 106.3, 107.8, 108.2, 109.0]
+        validation_func: |
+          def validate(output_from_function):
+              preds = output_from_function
+              if not isinstance(preds, list):
+                  return False
+              if len(preds) != 100:
+                  return False
+              for x in preds:
+                  if not isinstance(x, (int, float)):
+                      return False
+              return True

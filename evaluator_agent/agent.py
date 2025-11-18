@@ -1,16 +1,22 @@
                   
 import asyncio
+import importlib
+import importlib.util
 import json
 import logging
 import math
 import os
+import shutil
 import sys
 import tempfile
 import time
+import uuid
+from types import ModuleType
 from typing import Optional, Dict, Any, Tuple, List
 
 from config import settings
 from core.interfaces import EvaluatorAgentInterface, Program, TaskDefinition, BaseAgent
+from core.fitness import scalarize_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,26 @@ class EvaluatorAgent(EvaluatorAgentInterface, BaseAgent):
         except Exception as e:
             errors.append(f"Unexpected error during syntax check: {str(e)}")
         return errors
+
+    def _load_program_as_module(self, program: Program) -> Tuple[ModuleType, str]:
+        temp_dir = tempfile.mkdtemp()
+        module_name = f"candidate_{program.id.replace('-', '_')}_{uuid.uuid4().hex}"
+        temp_file_path = os.path.join(temp_dir, f"{module_name}.py")
+        with open(temp_file_path, "w", encoding="utf-8") as f:
+            f.write(program.code)
+
+        spec = importlib.util.spec_from_file_location(module_name, temp_file_path)
+        if spec is None or spec.loader is None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise ImportError(f"Unable to load module spec for program {program.id}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return module, module_name
 
     async def _execute_code_safely(
         self,
@@ -158,7 +184,7 @@ def custom_json_serializer(obj):
 
 print(json.dumps(final_output, default=custom_json_serializer))
 """
-        with open(temp_file_path, "w") as f:
+        with open(temp_file_path, "w", encoding="utf-8") as f:
             f.write(test_harness_code)
 
         # Generate a unique container name to manage it during timeouts
@@ -363,7 +389,7 @@ print(json.dumps(final_output, default=custom_json_serializer))
         correctness = passed_tests / total_tests
         return correctness, passed_tests, total_tests
 
-    async def evaluate_program(self, program: Program, task: TaskDefinition) -> Program:
+    async def _evaluate_with_tests(self, program: Program, task: TaskDefinition) -> Program:
         logger.info(f"Evaluating program: {program.id} for task: {task.id}")
         program.status = "evaluating"
         program.errors = []
@@ -499,8 +525,75 @@ print(json.dumps(final_output, default=custom_json_serializer))
             if f"Achieved {program.fitness_scores['correctness']*100:.0f}% correctness but not all tests passed." not in program.errors:
                  program.errors.append(f"Achieved {program.fitness_scores['correctness']*100:.0f}% correctness but not all tests passed.")
 
+        program.metrics = dict(program.fitness_scores)
+        program.fitness = program.fitness_scores.get("correctness", 0.0)
         logger.info(f"Overall evaluation complete for program {program.id}. Status: {program.status}, Fitness: {program.fitness_scores}")
         return program
+
+    async def _evaluate_with_metrics(self, program: Program, task: TaskDefinition) -> Program:
+        logger.info(f"Evaluating program {program.id} in metrics mode for task {task.id}")
+        program.status = "evaluating"
+        program.errors = []
+        program.metrics = {}
+
+        syntax_errors = self._check_syntax(program.code)
+        if syntax_errors:
+            program.errors.extend(syntax_errors)
+            program.status = "failed_evaluation"
+            program.fitness = 0.0
+            logger.warning(f"Syntax errors in program {program.id}: {syntax_errors}")
+            return program
+
+        module = None
+        module_name = ""
+        try:
+            module, module_name = self._load_program_as_module(program)
+            eval_module = importlib.import_module(task.metrics_eval_module)
+            eval_fn = getattr(eval_module, "evaluate_candidate", None)
+            if not callable(eval_fn):
+                raise AttributeError(f"Module '{task.metrics_eval_module}' does not expose callable evaluate_candidate()")
+
+            start = time.perf_counter()
+            raw_metrics = eval_fn(module, task)
+            elapsed = time.perf_counter() - start
+
+            if not isinstance(raw_metrics, dict):
+                raise ValueError("evaluate_candidate must return a dict[str, float]")
+
+            normalized_metrics: Dict[str, float] = {}
+            for key, value in raw_metrics.items():
+                if isinstance(value, (int, float)):
+                    normalized_metrics[key] = float(value)
+                else:
+                    logger.warning(f"Metric '{key}' from evaluator is non-numeric ({value}). It will be ignored.")
+
+            if "elapsed" not in normalized_metrics:
+                normalized_metrics["elapsed"] = elapsed
+
+            program.metrics = normalized_metrics
+            program.fitness = scalarize_metrics(normalized_metrics, task)
+            program.fitness_scores = dict(normalized_metrics)
+            program.fitness_scores["scalar_fitness"] = program.fitness
+            program.status = "evaluated"
+            logger.info(f"Metrics evaluation complete for program {program.id}. Fitness={program.fitness:.4f}, Metrics={normalized_metrics}")
+            return program
+        except Exception as exc:
+            program.status = "failed_evaluation"
+            program.errors.append(str(exc))
+            program.fitness = 0.0
+            logger.error(f"Metrics evaluation failed for program {program.id}: {exc}", exc_info=True)
+            return program
+        finally:
+            if module_name:
+                sys.modules.pop(module_name, None)
+
+    async def evaluate_program(self, program: Program, task: TaskDefinition) -> Program:
+        if task.evaluation_mode == "metrics":
+            if not task.metrics_eval_module:
+                logger.error(f"Task {task.id} is configured for metrics evaluation but no metrics_eval_module was provided. Falling back to test-based evaluation.")
+                return await self._evaluate_with_tests(program, task)
+            return await self._evaluate_with_metrics(program, task)
+        return await self._evaluate_with_tests(program, task)
 
     async def execute(self, program: Program, task: TaskDefinition) -> Program:
         return await self.evaluate_program(program, task)

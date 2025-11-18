@@ -2,18 +2,27 @@ import random
 import logging
 from typing import List, Dict, Any, Optional
 
-from core.interfaces import SelectionControllerInterface, Program, BaseAgent
+from core.interfaces import SelectionControllerInterface, Program, BaseAgent, TaskDefinition
 from config import settings
+from core.fitness import selection_sort_key, ensure_program_fitness
 
 logger = logging.getLogger(__name__)
 
 class Island:
-    def __init__(self, island_id: int, initial_programs: Optional[List[Program]] = None):
+    def __init__(
+        self,
+        island_id: int,
+        initial_programs: Optional[List[Program]] = None,
+        task_definition: Optional[TaskDefinition] = None,
+        sort_key_fn=None,
+    ):
         self.island_id = island_id
         self.programs = initial_programs or []
         self.generation = 0  # Island's internal generation counter
         self.best_fitness = 0.0
         self.last_improvement_generation = 0
+        self.task_definition = task_definition
+        self.sort_key_fn = sort_key_fn
         
         if settings.DEBUG:
             logger.debug(f"Initializing Island {island_id} with {len(self.programs)} programs")
@@ -31,27 +40,30 @@ class Island:
     def get_best_program(self) -> Optional[Program]:
         if not self.programs:
             return None
-        # Sort by correctness (higher is better), runtime (lower is better), generation (lower/older is better), and creation time (older is better)
         best_program = max(
             self.programs,
-            key=lambda p: (
-                p.fitness_scores.get("correctness", 0.0),  # Higher correctness preferred
-                -p.fitness_scores.get("runtime_ms", float('inf')),  # Lower runtime preferred
-                -p.generation,  # Older generation preferred
-                -p.created_at  # Older creation time preferred as tiebreaker
-            )
+            key=lambda p: self._sort_key(p)
         )
         if settings.DEBUG:
             logger.debug(f"Island {self.island_id} best program: ID={best_program.id}, "
-                        f"Correctness={best_program.fitness_scores.get('correctness')}, "
-                        f"Runtime={best_program.fitness_scores.get('runtime_ms')}, "
-                        f"Generation={best_program.generation}")
+                        f"Fitness={best_program.fitness}, Metrics={best_program.metrics or best_program.fitness_scores}")
         return best_program
+
+    def _sort_key(self, program: Program):
+        if self.sort_key_fn:
+            return self.sort_key_fn(program)
+        return (
+            program.fitness_scores.get("correctness", 0.0),
+            -program.fitness_scores.get("runtime_ms", float('inf')),
+            -program.generation,
+            -program.created_at,
+        )
 
     def update_metrics(self):
         best_program = self.get_best_program()
         if best_program:
-            current_best = best_program.fitness_scores.get("correctness", 0.0)
+            ensure_program_fitness(best_program, self.task_definition)
+            current_best = best_program.fitness or 0.0
             if current_best > self.best_fitness:
                 self.best_fitness = current_best
                 self.last_improvement_generation = self.generation
@@ -63,14 +75,18 @@ class Island:
             logger.debug(f"Island {self.island_id} generation incremented to {self.generation}")
 
 class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
-    def __init__(self):
+    def __init__(self, task_definition: Optional[TaskDefinition] = None):
         super().__init__()
         self.elitism_count = settings.ELITISM_COUNT
         self.num_islands = settings.NUM_ISLANDS
         self.migration_interval = settings.MIGRATION_INTERVAL
         self.islands: Dict[int, Island] = {}
         self.current_generation = 0
+        self.task_definition = task_definition
         logger.info(f"SelectionControllerAgent initialized with {self.num_islands} islands and elitism_count: {self.elitism_count}")
+
+    def _sort_key(self, program: Program):
+        return selection_sort_key(program, self.task_definition)
 
     def initialize_islands(self, initial_programs: List[Program]) -> None:
         """Initialize islands with the initial population."""
@@ -82,7 +98,12 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
             start_idx = i * programs_per_island
             end_idx = start_idx + programs_per_island if i < self.num_islands - 1 else len(initial_programs)
             island_programs = initial_programs[start_idx:end_idx]
-            self.islands[i] = Island(i, island_programs)
+            self.islands[i] = Island(
+                i,
+                island_programs,
+                task_definition=self.task_definition,
+                sort_key_fn=lambda p, self=self: selection_sort_key(p, self.task_definition),
+            )
             if settings.DEBUG:
                 logger.debug(f"Initialized Island {i} with {len(island_programs)} programs")
 
@@ -107,7 +128,7 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
 
             sorted_island_programs = sorted(
                 island.programs,
-                key=lambda p: (p.fitness_scores.get("correctness", 0.0), -p.fitness_scores.get("runtime_ms", float('inf')), -p.generation),
+                key=self._sort_key,
                 reverse=True
             )
             for i in range(min(len(sorted_island_programs), self.elitism_count)):
@@ -116,7 +137,7 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
         # Deduplicate elites (in case of migration having same elite in multiple islands)
         unique_elites = []
         seen_elite_ids = set()
-        for elite in sorted(all_elites, key=lambda p: (p.fitness_scores.get("correctness", 0.0), -p.fitness_scores.get("runtime_ms", float('inf')), -p.generation), reverse=True):
+        for elite in sorted(all_elites, key=self._sort_key, reverse=True):
             if elite.id not in seen_elite_ids:
                 unique_elites.append(elite)
                 seen_elite_ids.add(elite.id)
@@ -142,7 +163,7 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
             # Sort island programs to pick non-elites for roulette
             sorted_island_programs = sorted(
                 island.programs,
-                key=lambda p: (p.fitness_scores.get("correctness", 0.0), -p.fitness_scores.get("runtime_ms", float('inf')), -p.generation),
+                key=self._sort_key,
                 reverse=True
             )
             for program in sorted_island_programs:
@@ -162,7 +183,11 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
             return selected_parents
 
         # Perform roulette wheel selection on the combined pool of unique candidates
-        total_fitness_roulette = sum(p.fitness_scores.get("correctness", 0.0) + 0.0001 for p in unique_roulette_candidates) # Add small constant to allow selection of 0 fitness programs
+        total_fitness_roulette = 0.0
+        fitness_cache: Dict[str, float] = {}
+        for p in unique_roulette_candidates:
+            fitness_cache[p.id] = ensure_program_fitness(p, self.task_definition) + 0.0001
+            total_fitness_roulette += fitness_cache[p.id]
 
         if total_fitness_roulette <= 0.0001 * len(unique_roulette_candidates): # All candidates have near zero fitness
             num_to_select_randomly = min(remaining_parents_to_select, len(unique_roulette_candidates))
@@ -176,17 +201,17 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
                 current_sum = 0
                 chosen_parent = None
                 for i, program in enumerate(unique_roulette_candidates):
-                    current_sum += (program.fitness_scores.get("correctness", 0.0) + 0.0001)
+                    current_sum += fitness_cache.get(program.id, ensure_program_fitness(program, self.task_definition) + 0.0001)
                     if current_sum >= pick:
                         chosen_parent = program
                         unique_roulette_candidates.pop(i) # Remove chosen parent from further selection
-                        total_fitness_roulette -= (chosen_parent.fitness_scores.get("correctness", 0.0) + 0.0001) # Adjust total fitness
+                        total_fitness_roulette -= fitness_cache.get(chosen_parent.id, ensure_program_fitness(chosen_parent, self.task_definition) + 0.0001)
                         break
                 
                 if chosen_parent:
                     selected_parents.append(chosen_parent)
                     parent_ids_so_far.add(chosen_parent.id) # Track for debugging or future use
-                    logger.debug(f"Selected parent via global roulette: {chosen_parent.id} from island {chosen_parent.island_id} with correctness {chosen_parent.fitness_scores.get('correctness')}")
+                    logger.debug(f"Selected parent via global roulette: {chosen_parent.id} from island {chosen_parent.island_id} with fitness {chosen_parent.fitness}")
                 elif unique_roulette_candidates: # Fallback if pick logic fails (should not happen with correct total_fitness adjustment)
                     fallback_parent = random.choice(unique_roulette_candidates)
                     selected_parents.append(fallback_parent)
@@ -249,11 +274,7 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
             # Sort by correctness (higher is better), runtime (lower is better), and generation (lower/older is better)
             sorted_combined = sorted(
                 combined_population,
-                key=lambda p: (
-                    p.fitness_scores.get("correctness", 0.0),  # Higher correctness preferred
-                    -p.fitness_scores.get("runtime_ms", float('inf')),  # Lower runtime preferred
-                    -p.generation  # Older generation preferred
-                ),
+                key=self._sort_key,
                 reverse=True
             )
 
@@ -266,7 +287,7 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
                         seen_program_ids.add(program.id)
                         if settings.DEBUG:
                             logger.debug(f"Island {island_id} selected survivor: {program.id} "
-                                       f"with correctness {program.fitness_scores.get('correctness')}")
+                                       f"with fitness {program.fitness}")
                 else:
                     break
 
@@ -283,8 +304,14 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
             logger.debug("Starting migration process")
         
         # Identify underperforming islands
-        island_performances = [(island_id, island.get_best_program().fitness_scores.get("correctness", 0.0) if island.get_best_program() else 0.0) 
-                             for island_id, island in self.islands.items()]
+        island_performances = []
+        for island_id, island in self.islands.items():
+            best_program = island.get_best_program()
+            if best_program:
+                ensure_program_fitness(best_program, self.task_definition)
+                island_performances.append((island_id, best_program.fitness or 0.0))
+            else:
+                island_performances.append((island_id, 0.0))
         sorted_islands = sorted(island_performances, key=lambda x: x[1])
         
         # Select the worst performing half of islands
@@ -322,7 +349,8 @@ class SelectionControllerAgent(SelectionControllerInterface, BaseAgent):
                 if not any(p.id == migrant_program.id for p in recipient_island.programs):
                     recipient_island.programs.append(migrant_program)
                     if settings.DEBUG:
-                        logger.debug(f"Migrated program {migrant_program.id} (Correctness: {migrant_program.fitness_scores.get('correctness')}) "
+                        ensure_program_fitness(migrant_program, self.task_definition)
+                        logger.debug(f"Migrated program {migrant_program.id} (Fitness: {migrant_program.fitness}) "
                                    f"from island {donor_island_id} to island {underperforming_island_id}. "
                                    f"Recipient island size now: {len(recipient_island.programs)}")
                 else:

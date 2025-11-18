@@ -7,7 +7,7 @@ import time
 class Program:
     id: str
     code: str
-    fitness_scores: Dict[str, float] = field(default_factory=dict)                                                 
+    fitness_scores: Dict[str, float] = field(default_factory=dict)
     generation: int = 0
     parent_id: Optional[str] = None
     island_id: Optional[int] = None
@@ -15,6 +15,9 @@ class Program:
     status: str = "unevaluated"
     created_at: float = field(default_factory=lambda: time.time())  # Track program age
     task_id: Optional[str] = None
+    fitness: Optional[float] = None  # Scalarized fitness used for selection
+    metrics: Dict[str, float] = field(default_factory=dict)  # Raw metrics from evaluation
+    prompt_id: Optional[str] = None  # Track which prompt template produced this program
 
 @dataclass
 class TaskDefinition:
@@ -30,6 +33,12 @@ class TaskDefinition:
     allowed_imports: Optional[List[str]] = None
     tests: Optional[List[Dict[str, Any]]] = None # List of test groups. Each group is a dict, can include 'name', 'description', 'level' (for cascade), and 'test_cases'.
     expert_knowledge: Optional[str] = None # Relevant expert knowledge, equations, or snippets
+    evaluation_mode: str = "tests"  # "tests" | "metrics"
+    metrics_eval_module: Optional[str] = None
+    metrics_primary_key: Optional[str] = None
+    metrics_scalarization: Optional[Dict[str, float]] = None
+    metrics_success_key: Optional[str] = "success"
+    metrics_config: Optional[Dict[str, Any]] = None
 
 class BaseAgent(ABC):
     """Base class for all agents."""

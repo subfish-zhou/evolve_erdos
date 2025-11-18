@@ -116,7 +116,8 @@ async def run_evolution(
             description=description,
             function_name_to_evolve=function_name,
             input_output_examples=examples,
-            allowed_imports=allowed_imports
+            allowed_imports=allowed_imports,
+            evaluation_mode="tests"
         )
         
                                     

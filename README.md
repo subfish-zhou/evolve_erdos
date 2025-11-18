@@ -50,7 +50,7 @@ OpenAlpha_Evolve employs a modular, agent-based architecture to orchestrate an e
     *   *Initial Prompts*: To generate the first set of candidate solutions.
     *   *Mutation Prompts*: To introduce variations and improvements to existing solutions, often requesting changes in a "diff" format.
     *   *Bug-Fix Prompts*: To guide the LLM in correcting errors from previous attempts, also typically expecting a "diff".
-3.  **Code Generation (`CodeGeneratorAgent`)**: Powered by an LLM (currently configured for Gemini), this agent takes the prompts and generates Python code. If a "diff" is requested and received, it attempts to apply the changes to the parent code.
+3.  **Code Generation (`CodeGeneratorAgent`)**: 默认通过 Azure OpenAI GPT-5-mini（Managed Identity + `azure_api.AzureOpenAIClient`）生成代码，并在 `USE_AZURE_OPENAI=False` 时回退到 LiteLLM/其他提供商。若提示要求输出 diff，代理会尝试将 diff 应用到父代代码。
 4.  **Evaluation (`EvaluatorAgent`)**: The generated code is put to the test!
     *   *Syntax Check*: Is the code valid Python?
     *   *Execution*: The code is run in a temporary, isolated environment against the input/output examples defined in the task.
@@ -66,13 +66,15 @@ OpenAlpha_Evolve employs a modular, agent-based architecture to orchestrate an e
 
 ## 🚀 Key Features
 
-*   **LLM-Powered Code Generation**: Leverages state-of-the-art Large Language Models via LiteLLM, supporting multiple providers (OpenAI, Anthropic, Google, etc.).
+*   **LLM-Powered Code Generation**: 开箱即用地对接 Azure OpenAI GPT-5（含自定义超时/重试、托管身份认证），并可通过 LiteLLM 回退到任意其他模型提供商。
 *   **Evolutionary Algorithm Core**: Implements iterative improvement through selection, LLM-driven mutation/bug-fixing using diffs, and survival.
 *   **Modular Agent Architecture**: Easily extend or replace individual components (e.g., use a different LLM, database, or evaluation strategy).
 *   **Automated Program Evaluation**: Syntax checking and functional testing against user-provided examples. Code execution is sandboxed using **Docker containers** for improved security and dependency management, with configurable timeout mechanisms.
+*   **连续多指标 + 启发式搜索模式**: `TaskDefinition` 现已支持 `evaluation_mode: "metrics"`，用户可挂接自定义 `evaluate_candidate()` 模块返回 `dict[str, float]`，对“搜索器”类程序进行连续、多维打分（主指标 + 线性标量化 + success 优先级），SelectionController 会据此排序。
 *   **Configuration Management**: Easily tweak parameters like population size, number of generations, LLM models, API settings, and Docker configurations via `config/settings.py` and `.env`.
 *   **Detailed Logging**: Comprehensive logs provide insights into each step of the evolutionary process.
 *   **Diff-based Mutations**: The system is designed to use diffs for mutations and bug fixes, allowing for more targeted code modifications by the LLM.
+*   **Prompt 多样化**: `PromptDesignerAgent` 在初始/变异/修复阶段都会随机采样多种模板（记录 `prompt_id`），便于后续统计或扩展 “meta-prompt evolution”。
 *   **Open Source & Extensible**: Built with Python, designed for experimentation and community contributions.
 
 ---
@@ -125,42 +127,31 @@ OpenAlpha_Evolve employs a modular, agent-based architecture to orchestrate an e
     pip install -r requirements.txt
     ```
 
-5.  **Set Up Environment Variables (Crucial for API Keys)**:
-    *   **This step is essential for the application to function correctly with your API keys.** The `.env` file stores your sensitive credentials and configuration, overriding the default placeholders in `config/settings.py`.
-    *   Create your personal environment file by copying the example:
+5.  **Set Up Environment Variables (必需)**:
+    *   仓库当前未附带 `.env_example`，请手动创建 `.env`（或在 shell 中直接导出变量）。
+    *   **Azure OpenAI（默认路径）**：
         ```bash
-        cp .env_example .env
+        USE_AZURE_OPENAI=True
+        ENDPOINT_URL="https://your-endpoint.openai.azure.com/"
+        DEPLOYMENT_NAME="gpt-5-mini"
+        AZURE_MANAGED_IDENTITY_CLIENT_ID="your-managed-identity-client-id"
+        AZURE_API_VERSION="2025-01-01-preview"
+        AZURE_HTTP_TIMEOUT_SECONDS=600
+        AZURE_MAX_RETRIES=3
         ```
-
-    #### LLM Configuration
-    Google Cloud authentication (e.g., via Application Default Credentials (ADC) or service account keys pointed to by `GOOGLE_APPLICATION_CREDENTIALS`) is a supported method for using Google's LLMs.
-
-    To set up your environment variables for Google Cloud, you can use one of the following methods. These should be added to your `.env` file:
-
-    ```bash
-    # For Google Cloud (Vertex AI / AI Studio)
-    # Option 1: Using Application Default Credentials (ADC)
-    # Ensure you have authenticated via gcloud CLI:
-    # gcloud auth application-default login
-    # Or set the GOOGLE_APPLICATION_CREDENTIALS environment variable:
-    # GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
-
-    # Option 2: Directly using an API Key for specific Google services (e.g., Gemini API)
-    # GEMINI_API_KEY="your_gemini_api_key"
-    ```
-
-    This project uses LiteLLM to interface with various LLM providers. For providers other than Google Cloud (e.g., OpenAI, Anthropic, Cohere), please refer to the [LiteLLM documentation](https://docs.litellm.ai/docs/providers) for the specific environment variables required. Common examples include:
-    ```bash
-    # OPENAI_API_KEY="your_openai_api_key"
-    # ANTHROPIC_API_KEY="your_anthropic_api_key"
-    # COHERE_API_KEY="your_cohere_api_key"
-    ```
-    Add the necessary API key variables for your chosen LLM provider(s) to your `.env` file.
+        需确保运行环境具备可用的 Azure Managed Identity，或在本地设置 `DefaultAzureCredential` 支持的凭据。
+    *   **LiteLLM / 其他模型（可选回退）**：当 `USE_AZURE_OPENAI=False` 时，`CodeGeneratorAgent` 使用 LiteLLM 的 `LITELLM_DEFAULT_MODEL`。请根据 [LiteLLM 文档](https://docs.litellm.ai/docs/providers) 配置相应 API Key，例如：
+        ```bash
+        USE_AZURE_OPENAI=False
+        LITELLM_DEFAULT_MODEL="gpt-4o-mini"
+        OPENAI_API_KEY="sk-..."
+        ```
+    *   可根据需要添加 Google/Anthropic/Cohere 等额外变量，或为评估器设置 `EVALUATION_API_KEY`。
 
 6.  **Run OpenAlpha_Evolve!**
-    Run the example task (Dijkstra's algorithm) with:
+    以 Dijkstra 示例启动：
     ```bash
-    python -m main examples/shortest_path.yaml
+    python main.py examples/shortest_path.yaml
     ```
     Watch the logs in your terminal to see the evolutionary process unfold! Log files are also saved to `alpha_evolve.log` (by default).
 
@@ -170,6 +161,21 @@ OpenAlpha_Evolve employs a modular, agent-based architecture to orchestrate an e
     python app.py
     ```
     Gradio will display a local URL (e.g., http://127.0.0.1:7860) and a public share link if enabled. Open this in your browser to define custom tasks and run the evolution process interactively.
+
+### 🌲 Continuous Metrics Demo: Erdős 993
+
+The repository now includes a fully metrics-driven benchmark inspired by AlphaEvolve's Erdős–Moser explorations. It treats the program under evolution as a **search heuristic** instead of a direct solver.
+
+```bash
+python -m main examples/erdos_993.yaml
+```
+
+Key facts:
+
+- `evaluation_mode: "metrics"` tells the framework to import `examples.erdos_993_eval.evaluate_candidate`.
+- Your candidate must implement `search_erdos_993(seed: int, budget: int) -> dict`, iterate over random seeds, and return telemetry such as `candidate`, `best_violation`, and `samples_tried`.
+- The evaluator computes continuous metrics (`score`, `valid_ratio`, `runtime_penalty`, …) and SelectionController scalarizes them (primary key `score`, fallback linear weights).
+- Even if no counter-example is found yet, the best violation magnitude provides a gradient for evolution, mirroring the “soft objectives” used in the original AlphaEvolve work.
 
 ---
 
@@ -207,6 +213,29 @@ tests:
 ```
 
 See the example in `examples/shortest_path.yaml`
+
+#### Metrics Mode & Search Heuristics
+
+For research-style problems (new combinatorial bounds, hardware heuristics, etc.) you can switch the task into metrics mode:
+
+```yaml
+evaluation_mode: "metrics"
+metrics_eval_module: "examples.erdos_993_eval"
+metrics_primary_key: "score"
+metrics_scalarization:
+  score: 1.0
+  runtime_penalty: 0.1
+metrics_config:
+  seeds: [0, 1, 2, 3, 4]
+  budget: 512
+```
+
+Guidelines:
+
+- Implement a *searcher* function (e.g., `search_erdos_993(seed: int, budget: int)`) that can continue exploration across generations. It should return telemetry such as `{"candidate": ..., "best_violation": 0.42, "samples_tried": 1024}`.
+- Provide an evaluation module exposing `evaluate_candidate(program_module, task_definition) -> dict[str, float]`. This keeps heavy validation logic (simulators, proof checkers, etc.) outside of Docker test harnesses.
+- Define a primary metric and optional scalarization weights so SelectionController can order individuals in multi-dimensional metric space.
+- Check `examples/erdos_993.yaml` + `examples/erdos_993_eval.py` for a complete reference implementation.
 
 ### 2. Using Python Code (Legacy)
 

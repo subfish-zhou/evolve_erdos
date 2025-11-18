@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock, call
 
 # Ensure the test runner can find the modules
@@ -296,6 +297,34 @@ def validate(input):
         self.assertEqual(evaluated_program.fitness_scores["passed_tests"], 0.0)
         self.assertEqual(evaluated_program.fitness_scores["total_tests"], 1.0)
         self.assertIn("Failed 1 of 1 tests at Level 0 ('default_level').", evaluated_program.errors)
+
+    @patch('evaluator_agent.agent.importlib.import_module')
+    async def test_metrics_mode_scalarization(self, mock_import_module):
+        agent = EvaluatorAgent()
+        program = Program(id="metrics_prog", code="def search_erdos_993(*args, **kwargs):\n    return {}", parent_id=None)
+        task_definition = TaskDefinition(
+            id="metrics_task",
+            description="Metrics based task",
+            function_name_to_evolve="search_erdos_993",
+            evaluation_mode="metrics",
+            metrics_eval_module="examples.erdos_993_eval",
+            metrics_primary_key="score"
+        )
+
+        dummy_eval_module = SimpleNamespace()
+        dummy_eval_module.evaluate_candidate = lambda module, task: {"score": 0.5, "valid_ratio": 0.8}
+        mock_import_module.return_value = dummy_eval_module
+
+        def fake_load_module(self, program):
+            module = SimpleNamespace(search_erdos_993=lambda **kwargs: {"best_violation": 0.3, "samples_tried": 10})
+            return module, "dummy_candidate_module"
+
+        with patch.object(EvaluatorAgent, "_load_program_as_module", fake_load_module):
+            evaluated = await agent.evaluate_program(program, task_definition)
+            self.assertEqual(evaluated.status, "evaluated")
+            self.assertAlmostEqual(evaluated.metrics["score"], 0.5)
+            self.assertAlmostEqual(evaluated.fitness, 0.5)
+            self.assertIn("scalar_fitness", evaluated.fitness_scores)
 
 
 if __name__ == '__main__':

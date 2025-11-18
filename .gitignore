@@ -123,3 +123,6 @@ Thumbs.db
 openalpha_evolve_workflow
 *.dot 
 .gradio
+
+
+azure_api.py

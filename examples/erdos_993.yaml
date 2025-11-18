@@ -1,0 +1,51 @@
+task_id: "erdos_993_alphaevolve_counterexample_linf_adjlist"
+task_description: |
+  Evolve a *search heuristic* (not a single-shot solver) that continuously generates undirected forests
+  in pursuit of a counterexample to the Erdős–Moser conjecture: a forest whose independence-set counting
+  sequence is **non-unimodal**. Each candidate forest is represented as an adjacency list (list of lists
+  or dict of lists) describing an undirected, loop-free structure. The evaluator calls the heuristic
+  repeatedly with different random seeds and time budgets, and for every run it measures:
+    * the L_infinity distance from the candidate’s independence-sequence to the nearest unimodal sequence;
+    * runtime / telemetry information to estimate exploration efficiency;
+    * whether a genuine counterexample (score > 0) was discovered.
+  The heuristic must therefore act like a multi-step search algorithm: track the best violation value
+  seen so far, explore a diverse set of forests, and surface enough metadata for downstream selection to
+  make informed decisions. Even if no true counterexample is found, the heuristic should maximize the
+  “unimodality violation” metric so that the evolutionary loop receives a smooth fitness landscape.
+function_name: "search_erdos_993"
+allowed_imports: ["math", "random", "itertools", "collections"]
+evaluation_mode: "metrics"
+metrics_eval_module: "examples.erdos_993_eval"
+metrics_primary_key: "score"
+metrics_scalarization:
+  score: 1.0
+  runtime_penalty: 0.2
+  valid_ratio: 0.1
+metrics_config:
+  seeds: [0, 1, 2, 3, 4]
+  budget: 512
+  max_nodes: 30
+evaluation_criteria:
+  interface: |
+    Implement `search_erdos_993(seed: int, budget: int) -> dict`.
+    Expectations for each invocation:
+      1. Use the provided `seed` to initialize any RNGs so the evaluator can reproduce behavior.
+      2. Treat `budget` as the maximum number of internal iterations / samples you may draw; you may use
+         it to control loop bounds, simulated annealing steps, backtracking depth, etc.
+      3. Return a dictionary with at least the following telemetry fields:
+           {
+             "candidate": <adjacency list or dict>,
+             "best_violation": <float>,
+             "samples_tried": <int>,
+             "notes": <optional string for debugging>
+           }
+         - `candidate` must describe an undirected forest. The evaluator enforces symmetry and absence
+           of cycles; invalid graphs will be rejected.
+         - `best_violation` is the highest L_inf deviation you observed during this run; it should be
+           positive when a real counterexample is found, but can also be a non-positive “progress score”
+           when the search only approximates unimodality.
+         - `samples_tried` counts how many candidate forests you evaluated internally; this helps the
+           evaluator normalize runtime-efficiency metrics.
+         - `notes` is optional but encouraged (e.g., strategy name, last tweak applied, etc.).
+      4. If you cannot produce a valid `candidate`, set it to `None` but still report `best_violation`
+         so that evolution has a continuous signal to optimize.
